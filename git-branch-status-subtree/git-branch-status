@@ -37,6 +37,7 @@ USAGE:
   git-branch-status [ base-branch-name compare-branch-name ]
   git-branch-status [ -a | --all ]
   git-branch-status [ -b | --branch ] [filter-branch-name]
+  git-branch-status [ -c | --combined ]
   git-branch-status [ -d | --dates ]
   git-branch-status [ -h | --help ]
   git-branch-status [ -l | --local ]
@@ -79,6 +80,16 @@ EXAMPLES:
   $ git-branch-status --branch specific-branch
     | specific-branch | (even) | (ahead 2) | origin/specific-branch |
 
+  # show all local branches and remote branches (from 'origin' only) - pairing even those that aren't tracking
+  $ git-branch-status -c
+  $ git-branch-status --all
+    | local-branch             | n/a        | n/a       | (no upstream)                   |
+    | master                   | (even)     | (ahead 1) | origin/master                   | < white text (not up-to-date)
+    | matching-behind          | (behind 1) | (even)    | origin/matching-behind          | < grey text (not tracking out-of-date)
+    | matching-but-not-tracked | (even)     | (even)    | origin/matching-but-not-tracked | < light blue text (not tracking up-to-date)
+    | tracked-branch           | (even)     | (even)    | origin/tracked-branch           | < blue text (up-to-date)
+    | (no local)               | n/a        | n/a       | origin/untracked-branch         |
+
   # show the timestamp of each HEAD
   $ git-branch-status -d
   $ git-branch-status --dates
@@ -119,8 +130,11 @@ readonly CRED='\033[0;31m'
 readonly CGREEN='\033[0;32m'
 readonly CYELLOW='\033[1;33m'
 readonly CBLUE='\033[1;34m'
+readonly CDARKGREY='\033[1;90m'
+readonly CLIGHTBLUE='\033[1;94m'
 readonly CEND='\033[0m'
 readonly CDEFAULT=$CWHITE
+readonly CPAIRED=$CDARKGREY
 readonly CTRACKING=$CBLUE
 readonly CAHEAD=$CYELLOW
 readonly CBEHIND=$CRED
@@ -421,6 +435,7 @@ function PrintReport # (table_header_line no_results_msg)
 # parse CLI switches
 show_dates=0
 show_all=0
+show_all_combined=0
 show_all_local=0
 show_all_upstream=0
 show_all_remote=0
@@ -429,11 +444,12 @@ show_all_remote=0
 case "$1" in
   '-a'|'--all'      ) show_all=1                                                ;;
   '-b'|'--branch'   ) [ "$2" ] && branch_a="$2" || branch_a=$(GetCurrentBranch) ;;
+  '-c'|'--combined' ) show_all_combined=1                                       ;;
   '-d'|'--dates'    ) show_dates=1                                              ;;
   '-h'|'--help'     ) echo "$USAGE" ; exit                                      ;;
   '-l'|'--local'    ) show_all_local=1 ; show_all_upstream=1 ;                  ;;
   '-r'|'--remotes'  ) show_all_remote=1                                         ;;
-  '-v'|'--verbose'  ) show_all=1 ; show_dates=1                                 ;;
+  '-v'|'--verbose'  ) show_all=1 ;  show_dates=1            ;;
   *                 ) branch_a="$1" branch_b="$2"                               ;;
 esac
 
@@ -446,36 +462,73 @@ readonly FILTER_BRANCH=$branch_a
 readonly COMPARE_BRANCH=$branch_b
 readonly SHOW_DATES=$show_dates
 readonly SHOW_ALL=$show_all
-readonly SHOW_ALL_LOCAL=$(($show_all    + $show_all_local))    # show local branches that are not tracking any upstream
-readonly SHOW_ALL_UPSTREAM=$(($show_all + $show_all_upstream)) # show local branches that are synchronized with their upstream
-readonly SHOW_ALL_REMOTE=$(($show_all   + $show_all_remote))   # show all remote branches
+readonly SHOW_ALL_COMBINED=$show_all_combined
+readonly SHOW_ALL_LOCAL=$(($show_all    + $show_all_combined + $show_all_local))    # show local branches that are not tracking any upstream
+readonly SHOW_ALL_UPSTREAM=$(($show_all + $show_all_combined + $show_all_upstream)) # show local branches that are synchronized with their upstream
+readonly SHOW_ALL_REMOTE=$(($show_all   + $show_all_combined + $show_all_remote))   # show all remote branches
 
-if [ -z "$COMPARE_BRANCH" ]; then
-  [ "$FILTER_BRANCH" ] && synched_msg="$BRANCH_SYNCED_MSG" || synched_msg="$LOCALS_SYNCED_MSG"
-  # compare sync status of local branches to their upstreams
-  while read local upstream; do
-    GenerateReport $local $upstream
+if (( $SHOW_ALL_COMBINED )); then
+  # compare sync status of remote branches to local branches with the same names
+  remotes=`git remote`
+  for remote_repo in $remotes; do
+    all_remote_branches="$all_remote_branches`GetRemoteRefs $remote_repo`"
+  done
+  unpaired_remote_branches=$all_remote_branches
+
+  while read local_branch upstream_branch; do
+    if [[ $upstream_branch ]]; then # If there's an upstream set
+      unpaired_remote_branches=${unpaired_remote_branches/$upstream_branch/} # remove matching upstream from unpaired list
+      GenerateReport $local_branch $upstream_branch
+    else # look for first remote branch with the exact same name
+      for remote_repo in $remotes; do
+        remote_branch=''
+        if [[ ! $remote_branch ]]; then
+          if [[ $unpaired_remote_branches = *"$remote_repo/$local_branch"* ]]; then
+            remote_branch="$remote_repo/$local_branch";
+            unpaired_remote_branches=${unpaired_remote_branches/$remote_branch/} # remove matching upstream from unpaired list
+          fi
+        fi
+      done
+
+      GenerateReport $local_branch $remote_branch true
+    fi
   done < <(GetLocalRefs)
 
-  PrintReport "local <-> upstream" "$synched_msg"
-else
-  is_tracked_branch=$(IsTrackedBranch $FILTER_BRANCH $COMPARE_BRANCH)
-  (($is_tracked_branch)) && synched_msg="$BRANCH_SYNCED_MSG" || synched_msg="$UNTRACKED_SYNCHED_MSG"
-
-  # compare sync status of arbitrary branches per cli args
-  GenerateReport $FILTER_BRANCH $COMPARE_BRANCH
-  PrintReport "$FILTER_BRANCH <-> $COMPARE_BRANCH" "$synched_msg"
-fi
-
-
-(($SHOW_ALL_REMOTE)) && [ -z "$FILTER_BRANCH" ] || exit
-
-# compare sync status of remote branches to local branches with the same names
-for remote_repo in `git remote`; do
-  while read remote_branch; do
-    local_branch=${remote_branch#$remote_repo/}
+  for remote_branch in $unpaired_remote_branches; do
+    # Substring Removal - ${string#substring} - Delete shortest match of $substring from front of $string.
+    local_branch=${remote_branch#origin/}
     GenerateReport $local_branch $remote_branch
-  done < <(GetRemoteRefs $remote_repo)
+  done
 
-  PrintReport "local <-> $remote_repo" "$REMOTES_SYNCED_MSG"
-done
+  PrintReport "local <-> upstream/remote" "$REMOTES_SYNCED_MSG"
+else
+  if [ -z "$COMPARE_BRANCH" ]; then
+    [ "$FILTER_BRANCH" ] && synched_msg="$BRANCH_SYNCED_MSG" || synched_msg="$LOCALS_SYNCED_MSG"
+    # compare sync status of local branches to their upstreams
+    while read local upstream; do
+      GenerateReport $local $upstream
+    done < <(GetLocalRefs)
+
+    PrintReport "local <-> upstream" "$synched_msg"
+  else
+    is_tracked_branch=$(IsTrackedBranch $FILTER_BRANCH $COMPARE_BRANCH)
+    (($is_tracked_branch)) && synched_msg="$BRANCH_SYNCED_MSG" || synched_msg="$UNTRACKED_SYNCHED_MSG"
+
+    # compare sync status of arbitrary branches per cli args
+    GenerateReport $FILTER_BRANCH $COMPARE_BRANCH
+    PrintReport "$FILTER_BRANCH <-> $COMPARE_BRANCH" "$synched_msg"
+  fi
+
+  (($SHOW_ALL_REMOTE)) && [ -z "$FILTER_BRANCH" ] || exit
+
+  # compare sync status of remote branches to local branches with the same names
+  for remote_repo in `git remote`; do
+    while read remote_branch; do
+      # Substring Removal - ${string#substring} - Delete shortest match of $substring from front of $string.
+      local_branch=${remote_branch#$remote_repo/}
+      GenerateReport $local_branch $remote_branch
+    done < <(GetRemoteRefs $remote_repo)
+
+    PrintReport "local <-> $remote_repo" "$REMOTES_SYNCED_MSG"
+  done
+fi
